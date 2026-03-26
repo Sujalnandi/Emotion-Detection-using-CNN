@@ -1,9 +1,13 @@
 import cv2
 import numpy as np
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
 from sklearn.utils.class_weight import compute_class_weight
 
-from config import EMOTION_CLASSES
+try:
+    from config import EMOTION_CLASSES
+except ModuleNotFoundError:
+    from backend.config import EMOTION_CLASSES
 
 
 def _equalize_grayscale(gray_image):
@@ -30,16 +34,25 @@ def preprocess_grayscale_image(x):
 
 
 def preprocess_rgb_for_transfer(x):
-    """Create robust RGB input by equalizing luminance from grayscale."""
-    if x.ndim == 3 and x.shape[-1] > 1:
-        gray = cv2.cvtColor(x.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    elif x.ndim == 3 and x.shape[-1] == 1:
-        gray = x[..., 0]
-    else:
-        gray = x
+    """
+    Proper EfficientNet preprocessing with batch dimension handling
+    """
 
-    gray = _equalize_grayscale(gray)
-    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype("float32") / 255.0
+    rgb = x.astype("float32")
+
+    # Convert grayscale to RGB if needed
+    if rgb.ndim == 3 and rgb.shape[-1] == 1:
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+    elif rgb.ndim == 2:
+        # Single channel image, convert to RGB
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+
+    # Resize to EfficientNet input size
+    rgb = cv2.resize(rgb, (224, 224))
+
+    # Apply EfficientNet preprocessing [-1, 1]
+    rgb = efficientnet_preprocess(rgb)
+
     return rgb
 
 

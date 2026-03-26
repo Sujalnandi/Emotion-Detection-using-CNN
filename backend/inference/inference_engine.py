@@ -1,13 +1,18 @@
 import os
-import importlib
+import logging
 from collections import deque
 from glob import glob
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from tensorflow.keras.models import load_model
 from tensorflow.keras.layers import Dense
+
+try:
+    from backend.preprocessing.preprocess import preprocess_rgb_for_transfer
+except ModuleNotFoundError:
+    from preprocessing.preprocess import preprocess_rgb_for_transfer
 
 try:
     from config import BEST_MODEL_PATH, EMOTION_CLASSES, FACE_DETECTOR_BACKEND, HAAR_CASCADE_PATH
@@ -16,10 +21,11 @@ except ModuleNotFoundError:
 
 MTCNN = None
 try:
-    _mtcnn_module = importlib.import_module("mtcnn")
-    MTCNN = getattr(_mtcnn_module, "MTCNN", None)
-except Exception:
+    from mtcnn import MTCNN
+except ImportError:
     MTCNN = None
+
+logger = logging.getLogger("backend.inference_engine")
 
 EMOTIONS = EMOTION_CLASSES
 INPUT_SIZE = (48, 48)
@@ -157,33 +163,42 @@ def load_model_safe(model_path: Optional[str] = None):
 
     # Compatibility path for some H5 files saved with extra Dense config keys
     # (e.g. quantization_config) that older/newer Keras versions may reject.
+    logger.info("Loading model from %s", path)
     try:
-        return load_model(path, compile=False)
+        model = load_model(path, compile=False)
+        logger.info("Model loaded successfully")
+        return model
     except (TypeError, ValueError) as exc:
         if "quantization_config" not in str(exc):
+            logger.exception("Model load failed")
             raise
 
         class DenseCompat(Dense):
             def __init__(self, *args, quantization_config=None, **kwargs):
                 super().__init__(*args, **kwargs)
 
+        logger.warning("Applying DenseCompat fallback while loading model")
         return load_model(path, compile=False, custom_objects={"Dense": DenseCompat})
 
 
 def init_face_detector(cascade_path: Optional[str] = None):
     """Initialize MTCNN detector with Haar fallback."""
     if FACE_DETECTOR_BACKEND.lower() == "mtcnn" and MTCNN is not None:
-        return {"backend": "mtcnn", "detector": MTCNN()}
+        try:
+            return {"backend": "mtcnn", "detector": MTCNN()}
+        except Exception as exc:
+            logger.warning("MTCNN initialization failed; falling back to Haar. Reason: %s", exc)
+    elif FACE_DETECTOR_BACKEND.lower() == "mtcnn" and MTCNN is None:
+        logger.warning("MTCNN backend requested but package is unavailable; falling back to Haar")
 
     path = cascade_path or HAAR_CASCADE_PATH
-    # Try OpenCV default cascade name first, then fallback to configured absolute path.
-    haar = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
-    if haar.empty():
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Haar cascade not found: {path}")
-        haar = cv2.CascadeClassifier(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Haar cascade not found: {path}")
+
+    haar = cv2.CascadeClassifier(path)
     if haar.empty():
         raise RuntimeError("Could not initialize Haar Cascade detector.")
+    logger.info("Using Haar Cascade face detector backend")
     return {"backend": "haar", "detector": haar}
 
 
@@ -238,12 +253,12 @@ def preprocess_face(face_bgr: np.ndarray, input_size: Tuple[int, int] = INPUT_SI
 
 
 def preprocess_face_transfer(face_bgr: np.ndarray, input_size: Tuple[int, int]) -> np.ndarray:
-    """Transfer-model preprocessing: equalized luminance as normalized RGB."""
-    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, input_size)
-    gray = cv2.equalizeHist(gray)
-    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype("float32") / 255.0
-    return np.expand_dims(rgb, axis=0)
+    """Transfer-model preprocessing consistent with training preprocessing."""
+    rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+    x = preprocess_rgb_for_transfer(rgb)
+    if x.shape[:2] != input_size:
+        x = cv2.resize(x, (input_size[1], input_size[0]))
+    return np.expand_dims(x, axis=0)
 
 
 def infer_model_profile(model) -> Tuple[Tuple[int, int], str]:
@@ -276,14 +291,14 @@ def _predict_face_probs(model, face_bgr: np.ndarray) -> np.ndarray:
 
 def predict_frame(
     frame: np.ndarray,
-    model=None,
-    detector=None,
+    model: Any = None,
+    detector: Optional[Dict[str, Any]] = None,
     predictor: Optional[EmotionPredictor] = None,
     confidence_threshold: float = 0.6,
     detection_interval: int = 2,
     detector_size: Optional[Tuple[int, int]] = (640, 480),
     max_detection_width: int = 800,
-):
+) -> Tuple[np.ndarray, str, float, np.ndarray, List[Dict[str, int]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Predict emotions for faces in a BGR frame and draw annotations.
 
     Returns:
@@ -398,9 +413,13 @@ def predict_frame(
             {
                 "id": face_id,
                 "bbox": (int(x), int(y), int(w), int(h)),
-                "emotion": display_label.capitalize(),
+                "emotion": display_label.lower(),
                 "confidence": float(conf),
                 "probabilities": probs.astype(float).tolist(),
+                "probabilityMap": {
+                    emotion: float(probs[i])
+                    for i, emotion in enumerate(EMOTIONS)
+                },
             }
         )
 

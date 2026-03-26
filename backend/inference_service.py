@@ -36,11 +36,10 @@ def _faces_payload(faces_predictions, width: int, height: int):
                     "w": w / max(width, 1),
                     "h": h / max(height, 1),
                 },
-                "emotion": str(face["emotion"]),
+                "emotion": str(face["emotion"]).lower(),
                 "confidence": float(face["confidence"]),
-                "probabilities": prob_vector,
-                "probabilityMap": {
-                    emotion.capitalize(): prob_vector[i]
+                "probabilities": {
+                    emotion: prob_vector[i]
                     for i, emotion in enumerate(EMOTIONS)
                     if i < len(prob_vector)
                 },
@@ -70,8 +69,8 @@ def infer_frame(
     all_probabilities = {emotion: float(probs[i]) for i, emotion in enumerate(EMOTIONS)}
 
     return {
-        "emotion": str(label).capitalize(),
-        "confidence": float(confidence * 100.0),
+        "emotion": str(label).lower(),
+        "confidence": float(confidence),
         "all_probabilities": all_probabilities,
         "boxes": _normalize_boxes(boxes, frame_w, frame_h),
         "faces": _faces_payload(faces_predictions, frame_w, frame_h),

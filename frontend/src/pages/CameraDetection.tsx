@@ -12,7 +12,7 @@ export default function CameraDetection() {
   const [detecting, setDetecting] = useState(false);
   const [result, setResult] = useState<PredictionResponse | null>(null);
 
-  const facePredictions = useMemo(() => result?.faces_predictions ?? [], [result]);
+  const facePredictions = useMemo(() => result?.faces ?? [], [result]);
 
   const startCamera = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
@@ -123,7 +123,7 @@ export default function CameraDetection() {
             <div className="mt-4 space-y-3">
               {facePredictions.length === 0 && <p className="text-sm text-slate-400">Start detection to view live scores.</p>}
               {facePredictions.map((face) => {
-                const probabilities = Object.entries(face.probabilityMap).sort((a, b) => b[1] - a[1]);
+                const probabilities = Object.entries(face.probabilities).sort((a, b) => b[1] - a[1]);
                 return (
                   <div key={face.id} className="rounded-xl border border-white/10 bg-white/5 p-3">
                     <p className="text-sm font-semibold text-white">

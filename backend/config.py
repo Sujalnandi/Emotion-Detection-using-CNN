@@ -1,4 +1,5 @@
 import os
+import cv2
 
 # Fixed class order across training and inference to avoid label mismatch.
 EMOTION_CLASSES = [
@@ -53,8 +54,4 @@ CONFUSION_MATRIX_PATH = os.path.join(ARTIFACTS_DIR, "confusion_matrix.png")
 CLASSIFICATION_REPORT_PATH = os.path.join(ARTIFACTS_DIR, "classification_report.txt")
 TRAINING_LOG_PATH = os.path.join(ARTIFACTS_DIR, "training_log.txt")
 
-HAAR_CASCADE_PATH = os.path.join(
-    os.path.dirname(__import__("cv2").__file__),
-    "data",
-    "haarcascade_frontalface_default.xml",
-)
+HAAR_CASCADE_PATH = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
