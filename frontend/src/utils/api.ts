@@ -12,8 +12,7 @@ export interface FacePrediction {
   bbox: FaceBox;
   emotion: string;
   confidence: number;
-  probabilities: number[];
-  probabilityMap: EmotionProbabilities;
+  probabilities: EmotionProbabilities;
 }
 
 export interface PredictionResponse {
@@ -21,16 +20,7 @@ export interface PredictionResponse {
   confidence: number;
   probabilities: EmotionProbabilities;
   boxes: FaceBox[];
-  faces_predictions: FacePrediction[];
-}
-
-export interface PredictEmotionResponse {
-  emotion: string;
-  confidence: number;
-  confidencePercent: number;
-  allProbabilities: EmotionProbabilities;
   faces: FacePrediction[];
-  boxes: FaceBox[];
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
@@ -71,11 +61,9 @@ function normalizeProbabilityMap(raw: unknown): EmotionProbabilities {
   return Object.fromEntries(entries);
 }
 
-function parsePredictPayload(payload: Record<string, unknown>): PredictEmotionResponse {
+function parsePredictPayload(payload: Record<string, unknown>): PredictionResponse {
   const confidence = normalizeConfidence(payload.confidence ?? payload.score ?? payload.probability);
-  const probabilities = normalizeProbabilityMap(
-    payload.all_probabilities ?? payload.probabilities ?? payload.probabilityMap
-  );
+  const probabilities = normalizeProbabilityMap(payload.probabilities ?? payload.all_probabilities);
 
   const facesRaw = Array.isArray(payload.faces)
     ? payload.faces
@@ -98,8 +86,7 @@ function parsePredictPayload(payload: Record<string, unknown>): PredictEmotionRe
       },
       emotion: String(row.emotion ?? "Unknown"),
       confidence: normalizeConfidence(row.confidence),
-      probabilities: Object.values(faceProb),
-      probabilityMap: faceProb,
+      probabilities: faceProb,
     };
   });
 
@@ -115,16 +102,15 @@ function parsePredictPayload(payload: Record<string, unknown>): PredictEmotionRe
   });
 
   return {
-    emotion: String(payload.emotion ?? payload.label ?? payload.predicted_emotion ?? "Unknown"),
+    emotion: String(payload.emotion ?? payload.label ?? payload.predicted_emotion ?? "unknown").toLowerCase(),
     confidence,
-    confidencePercent: confidence * 100,
-    allProbabilities: probabilities,
+    probabilities,
     faces,
     boxes,
   };
 }
 
-export async function predictEmotion(file: File): Promise<PredictEmotionResponse> {
+export async function predictEmotion(file: File): Promise<PredictionResponse> {
   const formData = new FormData();
   formData.append("image", file);
   formData.append("file", file);
@@ -148,7 +134,7 @@ export async function predictEmotion(file: File): Promise<PredictEmotionResponse
   return parsePredictPayload(payload);
 }
 
-export async function predictRealtimeBase64(frameBase64: string): Promise<PredictEmotionResponse> {
+export async function predictRealtimeBase64(frameBase64: string): Promise<PredictionResponse> {
   let res: Response;
   try {
     res = await fetch(`${API_BASE}/realtime`, {
@@ -179,7 +165,7 @@ export async function predictImage(file: File): Promise<PredictionResponse> {
   });
 
   if (!backend) raiseBackendError("/api/predict/image");
-  return backend;
+  return parsePredictPayload(backend as unknown as Record<string, unknown>);
 }
 
 export async function predictFrame(frameBlob: Blob): Promise<PredictionResponse> {
@@ -192,5 +178,5 @@ export async function predictFrame(frameBlob: Blob): Promise<PredictionResponse>
   });
 
   if (!backend) raiseBackendError("/api/predict/realtime");
-  return backend;
+  return parsePredictPayload(backend as unknown as Record<string, unknown>);
 }

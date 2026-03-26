@@ -20,7 +20,7 @@ export default function ImageDetection() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const facePredictions: FacePrediction[] = useMemo(
-    () => result?.faces_predictions ?? [],
+    () => result?.faces ?? [],
     [result]
   );
 
@@ -118,7 +118,7 @@ export default function ImageDetection() {
                 )}
 
                 {facePredictions.map((face) => {
-                  const probs = Object.entries(face.probabilityMap).sort((a, b) => b[1] - a[1]);
+                  const probs = Object.entries(face.probabilities).sort((a, b) => b[1] - a[1]);
                   return (
                     <div key={face.id} className="rounded-xl border border-white/10 bg-white/5 p-4">
                       <p className="text-xs text-slate-400">Face {face.id}</p>

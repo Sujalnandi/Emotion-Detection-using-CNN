@@ -5,14 +5,16 @@ import math
 import os
 import shutil
 import sys
-from typing import Dict
+from typing import Dict, Iterable, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 import tensorflow as tf
-from keras.callbacks import Callback, EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.callbacks import Callback, EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(CURRENT_DIR)
@@ -65,7 +67,13 @@ class CosineWarmRestart(Callback):
         lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1.0 + math.cos(math.pi * frac))
         optimizer = getattr(self.model, "optimizer", None)
         if optimizer is not None and hasattr(optimizer, "learning_rate"):
-            tf.keras.backend.set_value(optimizer.learning_rate, lr)
+            lr_obj = optimizer.learning_rate
+            try:
+                # Preferred path for TF variable learning rates.
+                lr_obj.assign(lr)
+            except Exception:
+                # Fallback for immutable or schedule-backed LR objects.
+                optimizer.learning_rate = lr
 
     def on_epoch_end(self, epoch, logs=None):
         self.epoch_in_cycle += 1
@@ -89,6 +97,114 @@ def validate_dataset_structure():
         raise FileNotFoundError(f"Train directory not found: {TRAIN_DIR}")
     if not os.path.isdir(TEST_DIR):
         raise FileNotFoundError(f"Test directory not found: {TEST_DIR}")
+
+
+def _extract_labels_from_dataset(dataset: tf.data.Dataset) -> np.ndarray:
+    labels: list[np.ndarray] = []
+    for _, y in dataset:
+        labels.append(np.asarray(y))
+    if not labels:
+        return np.array([], dtype=np.int32)
+    return np.concatenate(labels, axis=0).astype(np.int32)
+
+
+def _preprocess_batch(images: tf.Tensor, labels: tf.Tensor, num_classes: int) -> Tuple[tf.Tensor, tf.Tensor]:
+    images = tf.cast(images, tf.float32)
+    images = efficientnet_preprocess(images)
+    labels = tf.one_hot(tf.cast(labels, tf.int32), depth=num_classes)
+    return images, labels
+
+
+def _build_augmenter() -> tf.keras.Sequential:
+    return tf.keras.Sequential(
+        [
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.10),
+            tf.keras.layers.RandomZoom(0.15),
+            tf.keras.layers.RandomTranslation(0.08, 0.08),
+            tf.keras.layers.RandomContrast(0.12),
+        ],
+        name="fer_augmenter",
+    )
+
+
+def _compute_class_weights_from_labels(labels: np.ndarray) -> Dict[int, float]:
+    class_ids = np.unique(labels)
+    if class_ids.size == 0:
+        return {}
+    weights = compute_class_weight(class_weight="balanced", classes=class_ids, y=labels)
+    return {int(cid): float(w) for cid, w in zip(class_ids, weights)}
+
+
+def get_transfer_tfdata_datasets(batch_size: int, validation_split: float, seed: int = 42):
+    num_classes = len(EMOTION_CLASSES)
+    augmenter = _build_augmenter()
+
+    train_raw = tf.keras.utils.image_dataset_from_directory(
+        TRAIN_DIR,
+        labels="inferred",
+        label_mode="int",
+        class_names=EMOTION_CLASSES,
+        color_mode="rgb",
+        image_size=IMAGE_SIZE_RESNET,
+        batch_size=batch_size,
+        shuffle=True,
+        validation_split=validation_split,
+        subset="training",
+        seed=seed,
+    )
+
+    val_raw = tf.keras.utils.image_dataset_from_directory(
+        TRAIN_DIR,
+        labels="inferred",
+        label_mode="int",
+        class_names=EMOTION_CLASSES,
+        color_mode="rgb",
+        image_size=IMAGE_SIZE_RESNET,
+        batch_size=batch_size,
+        shuffle=False,
+        validation_split=validation_split,
+        subset="validation",
+        seed=seed,
+    )
+
+    test_raw = tf.keras.utils.image_dataset_from_directory(
+        TEST_DIR,
+        labels="inferred",
+        label_mode="int",
+        class_names=EMOTION_CLASSES,
+        color_mode="rgb",
+        image_size=IMAGE_SIZE_RESNET,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    options = tf.data.Options()
+    options.experimental_deterministic = False
+
+    train_ds = (
+        train_raw
+        .with_options(options)
+        .map(lambda x, y: (augmenter(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE)
+        .map(lambda x, y: _preprocess_batch(x, y, num_classes), num_parallel_calls=tf.data.AUTOTUNE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    val_ds = (
+        val_raw
+        .map(lambda x, y: _preprocess_batch(x, y, num_classes), num_parallel_calls=tf.data.AUTOTUNE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    test_ds = (
+        test_raw
+        .map(lambda x, y: _preprocess_batch(x, y, num_classes), num_parallel_calls=tf.data.AUTOTUNE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    train_labels = _extract_labels_from_dataset(train_raw.unbatch().batch(4096))
+    class_weights = _compute_class_weights_from_labels(train_labels)
+    return train_ds, val_ds, test_ds, class_weights
 
 
 def get_transfer_generators(batch_size: int):
@@ -137,8 +253,8 @@ def build_stage1_callbacks(model_save_path: str):
             mode="max",
             verbose=1,
         ),
-        EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True, mode="max", verbose=1),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1),
+        EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True, mode="min", verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=1),
     ]
 
 
@@ -151,14 +267,25 @@ def build_stage2_callbacks(model_save_path: str, fine_tune_lr: float):
             mode="max",
             verbose=1,
         ),
-        EarlyStopping(monitor="val_accuracy", patience=12, restore_best_weights=True, mode="max", verbose=1),
+        EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True, mode="min", verbose=1),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=5e-7, verbose=1),
         CosineWarmRestart(base_lr=fine_tune_lr, min_lr=max(fine_tune_lr * 0.05, 5e-7), cycle_length=8),
     ]
 
 
-def evaluate_on_test_and_log(model, test_gen, model_name: str):
-    eval_out = model.evaluate(test_gen, verbose=1)
+def unfreeze_last_n_layers(base_model: tf.keras.Model, last_n: int = 25) -> None:
+    """Unfreeze only the last N layers for stable stage-2 fine-tuning."""
+    last_n = max(1, int(last_n))
+    split_idx = max(0, len(base_model.layers) - last_n)
+    for idx, layer in enumerate(base_model.layers):
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = False
+        else:
+            layer.trainable = idx >= split_idx
+
+
+def evaluate_on_test_and_log(model, test_data, model_name: str):
+    eval_out = model.evaluate(test_data, verbose=1)
     if isinstance(eval_out, (list, tuple)):
         test_loss = float(eval_out[0])
         test_acc = float(eval_out[1]) if len(eval_out) > 1 else 0.0
@@ -202,10 +329,26 @@ def save_training_plot(history_stage1, history_stage2):
     plt.close()
 
 
-def save_confusion_matrix_and_report(model, test_gen):
-    test_gen.reset()
-    y_true = test_gen.classes
-    y_prob = model.predict(test_gen, verbose=1)
+def _dataset_true_labels(test_data) -> np.ndarray:
+    if hasattr(test_data, "classes"):
+        return np.asarray(test_data.classes)
+
+    labels: list[np.ndarray] = []
+    for _, y_batch in test_data:
+        y_np = y_batch.numpy()
+        if y_np.ndim > 1:
+            y_np = np.argmax(y_np, axis=1)
+        labels.append(y_np.astype(np.int32))
+    if not labels:
+        return np.array([], dtype=np.int32)
+    return np.concatenate(labels, axis=0)
+
+
+def save_confusion_matrix_and_report(model, test_data):
+    if hasattr(test_data, "reset"):
+        test_data.reset()
+    y_true = _dataset_true_labels(test_data)
+    y_prob = model.predict(test_data, verbose=1)
     y_pred = np.argmax(y_prob, axis=1)
 
     cm = confusion_matrix(y_true, y_pred)
@@ -243,7 +386,10 @@ def parse_args():
     parser.add_argument("--model", choices=["efficientnetb0", "mobilenetv2"], default="mobilenetv2")
     parser.add_argument("--epochs", type=int, default=100, help="Total epochs across both stages (recommended: 80-100).")
     parser.add_argument("--stage1-epochs", type=int, default=30, help="Frozen-backbone warmup epochs.")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--pipeline", choices=["tfdata", "generator"], default="tfdata")
+    parser.add_argument("--workers", type=int, default=4, help="Used only for generator pipeline")
+    parser.add_argument("--unfreeze-layers", type=int, default=25, help="Number of backbone layers to unfreeze in stage 2")
     parser.add_argument("--freeze-ratio", type=float, default=0.70, help="Fraction of backbone to keep frozen during fine-tuning.")
     parser.add_argument("--learning-rate", type=float, default=TRANSFER_LEARNING_RATE)
     parser.add_argument("--fine-tune-lr", type=float, default=FINE_TUNE_LEARNING_RATE)
@@ -298,6 +444,18 @@ def configure_runtime_device(device: str, mixed_precision: bool) -> str:
     )
 
 
+def log_gpu_info() -> None:
+    gpus = tf.config.list_physical_devices("GPU")
+    write_log(f"TensorFlow GPUs: {gpus}")
+    if gpus:
+        for idx, _ in enumerate(gpus):
+            try:
+                details = tf.config.experimental.get_device_details(gpus[idx])
+                write_log(f"GPU[{idx}] details: {details}")
+            except Exception:
+                write_log(f"GPU[{idx}] details unavailable")
+
+
 def main():
     args = parse_args()
     ensure_directories()
@@ -314,14 +472,33 @@ def main():
 
     write_log("=== Improved FER Training Pipeline ===")
     write_log(device_summary)
+    log_gpu_info()
     write_log(f"Backbone: {args.model}")
+    write_log(f"Pipeline: {args.pipeline}")
+    write_log(f"Stage-2 unfreeze layers: {args.unfreeze_layers}")
     write_log(f"Train directory: {TRAIN_DIR}")
     write_log(f"Test directory: {TEST_DIR}")
     write_log(f"Input resolution: {IMAGE_SIZE_RESNET[0]}x{IMAGE_SIZE_RESNET[1]} RGB")
     write_log(f"Epoch plan -> stage1: {stage1_epochs}, stage2: {stage2_epochs}, total: {stage1_epochs + stage2_epochs}")
 
-    train_gen, val_gen, test_gen = get_transfer_generators(batch_size=args.batch_size)
-    class_weights: Dict[int, float] = compute_generator_class_weights(train_gen)
+    if args.pipeline == "tfdata":
+        train_data, val_data, test_data, class_weights = get_transfer_tfdata_datasets(
+            batch_size=args.batch_size,
+            validation_split=VALIDATION_SPLIT,
+            seed=42,
+        )
+        fit_kwargs = {}
+    else:
+        train_gen, val_gen, test_gen = get_transfer_generators(batch_size=args.batch_size)
+        train_data, val_data, test_data = train_gen, val_gen, test_gen
+        class_weights = compute_generator_class_weights(train_gen)
+        fit_kwargs = {
+            "workers": int(args.workers),
+            "use_multiprocessing": True,
+            "max_queue_size": 32,
+        }
+
+    class_weights = class_weights if class_weights else {}
     write_log(f"Computed class weights: {class_weights}")
 
     model, base_model = build_efficientnet_transfer(
@@ -335,16 +512,17 @@ def main():
 
     write_log("\nStage 1: training attention head with frozen backbone...")
     history_stage1 = model.fit(
-        train_gen,
-        validation_data=val_gen,
+        train_data,
+        validation_data=val_data,
         epochs=stage1_epochs,
         callbacks=build_stage1_callbacks(EFFICIENTNET_MODEL_PATH),
         class_weight=class_weights,
         verbose=1,
+        **fit_kwargs,
     )
 
     write_log("\nStage 2: fine-tuning top backbone layers with low learning rate...")
-    unfreeze_last_layers_for_finetune(base_model, unfreeze_from_ratio=float(args.freeze_ratio))
+    unfreeze_last_n_layers(base_model, last_n=int(args.unfreeze_layers))
     compile_for_finetuning(
         model,
         learning_rate=float(args.fine_tune_lr),
@@ -352,13 +530,14 @@ def main():
     )
 
     history_stage2 = model.fit(
-        train_gen,
-        validation_data=val_gen,
+        train_data,
+        validation_data=val_data,
         epochs=stage1_epochs + stage2_epochs,
         initial_epoch=stage1_epochs,
         callbacks=build_stage2_callbacks(EFFICIENTNET_MODEL_PATH, fine_tune_lr=float(args.fine_tune_lr)),
         class_weight=class_weights,
         verbose=1,
+        **fit_kwargs,
     )
 
     val_acc_all = history_stage1.history.get("val_accuracy", []) + history_stage2.history.get("val_accuracy", [])
@@ -368,13 +547,13 @@ def main():
     shutil.copy2(EFFICIENTNET_MODEL_PATH, BEST_MODEL_PATH)
     write_log(f"Saved best model to: {BEST_MODEL_PATH}")
 
-    _, test_acc = evaluate_on_test_and_log(model, test_gen, f"{args.model} transfer")
+    _, test_acc = evaluate_on_test_and_log(model, test_data, f"{args.model} transfer")
     write_log(f"Final test accuracy: {test_acc:.4f}")
 
     save_training_plot(history_stage1, history_stage2)
     write_log(f"Saved training plot to: {TRAINING_HISTORY_PLOT}")
 
-    save_confusion_matrix_and_report(model, test_gen)
+    save_confusion_matrix_and_report(model, test_data)
     write_log(f"Saved confusion matrix to: {CONFUSION_MATRIX_PATH}")
     write_log(f"Saved classification report to: {CLASSIFICATION_REPORT_PATH}")
     write_log(f"Saved training log to: {TRAINING_LOG_PATH}")

@@ -4,68 +4,8 @@ import { motion } from "framer-motion";
 import { Camera, CameraOff, ImageUp, Loader2, Sparkles, TriangleAlert } from "lucide-react";
 import Button from "../components/Button";
 import Card from "../components/Card";
+import { predictEmotion, predictRealtimeBase64, type PredictionResponse } from "../utils/api";
 
-type PredictEmotionResponse = {
-  emotion: string;
-  confidence: number;
-  confidencePercent: number;
-  allProbabilities: Record<string, number>;
-  probabilities: Record<string, number>;
-  faces: Array<{
-    id: number;
-    emotion: string;
-    confidence: number;
-    bbox: { x: number; y: number; w: number; h: number };
-  }>;
-};
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
-
-function normalizeProbabilities(raw: unknown): Record<string, number> {
-  if (!raw || typeof raw !== "object") return {};
-  return Object.fromEntries(
-    Object.entries(raw as Record<string, unknown>).map(([key, value]) => {
-      const num = typeof value === "number" && !Number.isNaN(value) ? value : 0;
-      return [key.toLowerCase(), num > 1 ? Math.min(100, num) / 100 : Math.max(0, num)];
-    })
-  );
-}
-
-function toUiResult(payload: Record<string, unknown>): PredictEmotionResponse {
-  const rawConfidence = typeof payload.confidence === "number" ? payload.confidence : 0;
-  const confidencePercent = rawConfidence > 1 ? rawConfidence : rawConfidence * 100;
-  const probabilities = normalizeProbabilities(payload.probabilities ?? payload.all_probabilities);
-
-  const faces = Array.isArray(payload.faces)
-    ? payload.faces.map((face, index) => {
-        const row = (face ?? {}) as Record<string, unknown>;
-        const bbox = (row.bbox ?? {}) as Record<string, unknown>;
-        return {
-          id: Number(row.id ?? index + 1),
-          emotion: String(row.emotion ?? "Unknown"),
-          confidence:
-            typeof row.confidence === "number"
-              ? (row.confidence > 1 ? Math.min(100, row.confidence) / 100 : Math.max(0, row.confidence))
-              : 0,
-          bbox: {
-            x: Number(bbox.x ?? 0),
-            y: Number(bbox.y ?? 0),
-            w: Number(bbox.w ?? 0),
-            h: Number(bbox.h ?? 0),
-          },
-        };
-      })
-    : [];
-
-  return {
-    emotion: String(payload.emotion ?? "Unknown"),
-    confidence: confidencePercent / 100,
-    confidencePercent,
-    allProbabilities: probabilities,
-    probabilities,
-    faces,
-  };
-}
 
 export default function Detect() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -73,7 +13,7 @@ export default function Detect() {
   const intervalRef = useRef<number | null>(null);
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [result, setResult] = useState<PredictEmotionResponse | null>(null);
+  const [result, setResult] = useState<PredictionResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -81,7 +21,7 @@ export default function Detect() {
   const [realtimeActive, setRealtimeActive] = useState(false);
   const [realtimeLoading, setRealtimeLoading] = useState(false);
   const [realtimeError, setRealtimeError] = useState<string | null>(null);
-  const [realtimeResult, setRealtimeResult] = useState<PredictEmotionResponse | null>(null);
+  const [realtimeResult, setRealtimeResult] = useState<PredictionResponse | null>(null);
 
   useEffect(() => {
     if (!selectedFile) {
@@ -113,31 +53,8 @@ export default function Detect() {
     setError(null);
 
     try {
-      const formData = new FormData();
-      formData.append("image", selectedFile);
-
-      const response = await fetch(`${API_BASE}/predict`, {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = (await response.json()) as Record<string, unknown>;
-
-      if (!response.ok) {
-        console.error(data);
-        alert("API Error");
-        setError("Prediction request failed.");
-        setResult(null);
-        return;
-      }
-
-      if (typeof data.error === "string") {
-        setError(data.error);
-        setResult(null);
-        return;
-      }
-
-      setResult(toUiResult(data));
+      const prediction = await predictEmotion(selectedFile);
+      setResult(prediction);
     } catch (submissionError) {
       const message = submissionError instanceof Error ? submissionError.message : "Prediction request failed.";
       setError(message);
@@ -192,28 +109,8 @@ export default function Detect() {
 
     setRealtimeLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/realtime`, {
-        method: "POST",
-        body: JSON.stringify({ image: frameBase64 }),
-        headers: { "Content-Type": "application/json" },
-      });
-
-      const data = (await response.json()) as Record<string, unknown>;
-
-      if (!response.ok) {
-        console.error(data);
-        alert("API Error");
-        setRealtimeError("Realtime prediction failed.");
-        return;
-      }
-
-      if (typeof data.error === "string") {
-        setRealtimeError(data.error);
-        setRealtimeResult(null);
-        return;
-      }
-
-      setRealtimeResult(toUiResult(data));
+      const prediction = await predictRealtimeBase64(frameBase64);
+      setRealtimeResult(prediction);
       setRealtimeError(null);
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : "Realtime prediction failed.";
@@ -250,8 +147,8 @@ export default function Detect() {
     };
   }, []);
 
-  const probabilityEntries = Object.entries(result?.allProbabilities ?? {}).sort((a, b) => b[1] - a[1]);
-  const realtimeProbabilityEntries = Object.entries(realtimeResult?.allProbabilities ?? {}).sort((a, b) => b[1] - a[1]);
+  const probabilityEntries = Object.entries(result?.probabilities ?? {}).sort((a, b) => b[1] - a[1]);
+  const realtimeProbabilityEntries = Object.entries(realtimeResult?.probabilities ?? {}).sort((a, b) => b[1] - a[1]);
 
   return (
     <section className="px-4 py-12 sm:px-6 lg:px-8">
@@ -335,11 +232,11 @@ export default function Detect() {
 
                 <div className="rounded-xl border border-white/10 bg-white/5 p-4">
                   <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Confidence</p>
-                  <p className="mt-2 text-2xl font-bold text-cyan-200">{result.confidencePercent.toFixed(2)}%</p>
+                  <p className="mt-2 text-2xl font-bold text-cyan-200">{(result.confidence * 100).toFixed(2)}%</p>
                   <div className="mt-3 h-2.5 rounded-full bg-white/10">
                     <div
                       className="h-2.5 rounded-full bg-gradient-to-r from-blue-500 via-violet-500 to-cyan-400"
-                      style={{ width: `${Math.max(4, Math.min(100, result.confidencePercent))}%` }}
+                      style={{ width: `${Math.max(4, Math.min(100, result.confidence * 100))}%` }}
                     />
                   </div>
                 </div>
@@ -441,7 +338,7 @@ export default function Detect() {
                   <div className="rounded-lg border border-white/10 bg-slate-950/45 p-3">
                     <p className="text-xs text-slate-400">Emotion</p>
                     <p className="mt-1 text-xl font-semibold text-white">{realtimeResult.emotion}</p>
-                    <p className="text-sm text-cyan-200">Confidence: {realtimeResult.confidencePercent.toFixed(1)}%</p>
+                    <p className="text-sm text-cyan-200">Confidence: {(realtimeResult.confidence * 100).toFixed(1)}%</p>
                   </div>
 
                   <div className="space-y-2">
