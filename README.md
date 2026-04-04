@@ -18,10 +18,12 @@ This project is a B.Tech final-year AI/ML system for classifying facial emotions
 - Proper normalization (`rescale=1/255`)
 - Class balancing using class weights
 - Custom CNN baseline with BatchNorm, Dropout, and L2 regularization
-- Transfer learning with EfficientNetB0 (ImageNet pretraining)
+- Transfer learning with EfficientNetB3 (ImageNet pretraining)
 - Two-stage transfer training:
   - Stage 1: freeze backbone, train classifier head
-  - Stage 2: unfreeze top backbone layers, fine-tune with low LR
+  - Stage 2: unfreeze final 50-100 backbone layers, fine-tune with low LR
+- Focal loss + capped class weights (max 5) to improve minority classes
+- Mixed precision enabled automatically on GPU
 - Adam optimizer with LR tuning
 - Early stopping + ReduceLROnPlateau
 - 60-epoch training configuration (`config.py`)
@@ -34,7 +36,7 @@ This project is a B.Tech final-year AI/ML system for classifying facial emotions
 
 ### EfficientNet Transfer
 
-`Input(224x224x3) -> EfficientNetB0 Backbone -> GlobalAveragePooling -> BatchNorm -> Dense(256) -> Dropout -> Softmax(7)`
+`Input(224x224x3) -> EfficientNetB3 Backbone -> GlobalAveragePooling -> BatchNorm -> Dense(256) -> Dropout(0.5) -> Softmax(7)`
 
 This hybrid strategy gives a robust baseline (CNN) and a high-capacity transfer model (EfficientNet), which is typically better for FER validation accuracy.
 
@@ -89,7 +91,7 @@ pip install -r backend/requirements.txt
 ## Train
 
 ```bash
-python backend/scripts/train_model.py
+python backend/scripts/train_model.py --batch-size 32 --stage1-epochs 18 --stage2-epochs 42 --stage1-lr 1e-4 --class-weight-cap 5 --unfreeze-last-n 80
 ```
 
 Generated outputs:

@@ -1,0 +1,22 @@
+# Python cache and temp files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+*.tmp
+
+# Python envs
+.venv/
+.venv310/
+venv/
+env/
+
+# Frontend dependencies and build outputs
+frontend/node_modules/
+frontend/dist/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/settings.json
