@@ -139,17 +139,22 @@ class EmotionPredictor:
 
 
 def find_latest_model(search_root: Optional[str] = None) -> str:
-    """Find the most recent .h5 model, preferring best_model.h5 when available."""
+    """Find the most recent saved model, preferring .keras checkpoints."""
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     root = search_root or base
 
-    preferred = os.path.join(root, "artifacts", "best_model.h5")
+    preferred = os.path.join(root, "artifacts", "best_model.keras")
     if os.path.exists(preferred):
         return preferred
 
-    candidates = glob(os.path.join(root, "*.h5")) + glob(os.path.join(root, "artifacts", "*.h5"))
+    candidates = (
+        glob(os.path.join(root, "*.keras"))
+        + glob(os.path.join(root, "artifacts", "*.keras"))
+        + glob(os.path.join(root, "*.h5"))
+        + glob(os.path.join(root, "artifacts", "*.h5"))
+    )
     if not candidates:
-        raise FileNotFoundError("No .h5 model found. Train model first with train_model.py")
+        raise FileNotFoundError("No saved model found (.keras or .h5). Train model first with train_model.py")
 
     candidates.sort(key=os.path.getmtime, reverse=True)
     return candidates[0]
@@ -255,9 +260,7 @@ def preprocess_face(face_bgr: np.ndarray, input_size: Tuple[int, int] = INPUT_SI
 def preprocess_face_transfer(face_bgr: np.ndarray, input_size: Tuple[int, int]) -> np.ndarray:
     """Transfer-model preprocessing consistent with training preprocessing."""
     rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    x = preprocess_rgb_for_transfer(rgb)
-    if x.shape[:2] != input_size:
-        x = cv2.resize(x, (input_size[1], input_size[0]))
+    x = preprocess_rgb_for_transfer(rgb, target_size=input_size)
     return np.expand_dims(x, axis=0)
 
 
@@ -307,7 +310,7 @@ def predict_frame(
     if frame is None or frame.size == 0:
         raise ValueError("Invalid input frame.")
 
-    model = model or load_model_safe(BEST_MODEL_PATH)
+    model = model or load_model_safe(BEST_MODEL_PATH if os.path.exists(BEST_MODEL_PATH) else None)
     detector_bundle = detector or init_face_detector()
 
     annotated = frame.copy()
@@ -415,6 +418,7 @@ def predict_frame(
                 "bbox": (int(x), int(y), int(w), int(h)),
                 "emotion": display_label.lower(),
                 "confidence": float(conf),
+                "confidence_percent": float(conf * 100.0),
                 "probabilities": probs.astype(float).tolist(),
                 "probabilityMap": {
                     emotion: float(probs[i])
@@ -437,6 +441,7 @@ def predict_frame(
             "bbox": face["bbox"],
             "emotion": face["emotion"],
             "confidence": face["confidence"],
+            "confidence_percent": face.get("confidence_percent", float(face["confidence"]) * 100.0),
             "probabilities": face["probabilities"],
         }
         for face in faces_predictions

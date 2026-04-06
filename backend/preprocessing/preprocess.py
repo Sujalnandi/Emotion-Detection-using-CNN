@@ -1,112 +1,71 @@
+from __future__ import annotations
+
+from typing import Tuple
+
 import cv2
 import numpy as np
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
 from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 try:
     from config import EMOTION_CLASSES
 except ModuleNotFoundError:
     from backend.config import EMOTION_CLASSES
 
-
-def _equalize_grayscale(gray_image):
-    """Improve local contrast for in-the-wild lighting conditions."""
-    gray_uint8 = gray_image.astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray_uint8)
-    return cv2.GaussianBlur(enhanced, (3, 3), 0)
+EFFICIENTNET_INPUT_SIZE = (224, 224)
 
 
-def preprocess_grayscale_image(x):
-    """Apply grayscale contrast enhancement and normalize to [0, 1]."""
-    if x.ndim == 3 and x.shape[-1] > 1:
-        # flow_from_directory provides RGB arrays for color_mode="rgb".
-        gray = cv2.cvtColor(x.astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    elif x.ndim == 3 and x.shape[-1] == 1:
-        gray = x[..., 0]
-    else:
-        gray = x
+def _to_rgb(image: np.ndarray) -> np.ndarray:
+    """Convert 2D/1-channel image arrays to 3-channel RGB arrays."""
+    x = np.asarray(image)
 
-    gray = _equalize_grayscale(gray)
-    gray = gray.astype("float32") / 255.0
-    return np.expand_dims(gray, axis=-1)
+    if x.ndim == 2:
+        return np.stack([x, x, x], axis=-1)
 
+    if x.ndim == 3 and x.shape[-1] == 1:
+        return np.repeat(x, 3, axis=-1)
 
-def preprocess_rgb_for_transfer(x):
-    """
-    Proper EfficientNet preprocessing with batch dimension handling
-    """
+    if x.ndim == 3 and x.shape[-1] > 3:
+        return x[:, :, :3]
 
-    rgb = x.astype("float32")
-
-    # Convert grayscale to RGB if needed
-    if rgb.ndim == 3 and rgb.shape[-1] == 1:
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
-    elif rgb.ndim == 2:
-        # Single channel image, convert to RGB
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
-
-    # Resize to EfficientNet input size
-    rgb = cv2.resize(rgb, (224, 224))
-
-    # Apply EfficientNet preprocessing [-1, 1]
-    rgb = efficientnet_preprocess(rgb)
-
-    return rgb
+    return x
 
 
-def build_train_datagen(validation_split=0.2):
-    """Create training ImageDataGenerator with augmentation."""
-    return ImageDataGenerator(
-        preprocessing_function=preprocess_grayscale_image,
-        rotation_range=20,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        horizontal_flip=True,
-        zoom_range=0.2,
-        brightness_range=(0.8, 1.2),
-        fill_mode="nearest",
-        validation_split=validation_split,
-    )
+def preprocess_rgb_for_transfer(image: np.ndarray, target_size: Tuple[int, int] = EFFICIENTNET_INPUT_SIZE) -> np.ndarray:
+    """Shared preprocessing for EfficientNet training, validation, and inference."""
+    x = _to_rgb(image).astype("float32")
+
+    if x.shape[0] != target_size[0] or x.shape[1] != target_size[1]:
+        interp = cv2.INTER_AREA if (x.shape[0] > target_size[0] or x.shape[1] > target_size[1]) else cv2.INTER_LINEAR
+        x = cv2.resize(x, (target_size[1], target_size[0]), interpolation=interp)
+
+    return efficientnet_preprocess(x)
 
 
-def build_transfer_train_datagen(validation_split=0.2):
-    """Training datagen for transfer models with RGB tensors."""
+def build_transfer_train_datagen(validation_split: float = 0.2) -> ImageDataGenerator:
+    """Transfer-learning datagen using shared EfficientNet preprocessing."""
     return ImageDataGenerator(
         preprocessing_function=preprocess_rgb_for_transfer,
-        rotation_range=25,
-        width_shift_range=0.15,
-        height_shift_range=0.15,
-        horizontal_flip=True,
-        zoom_range=0.25,
-        shear_range=0.12,
-        brightness_range=(0.75, 1.3),
-        fill_mode="nearest",
         validation_split=validation_split,
     )
 
 
-def build_eval_datagen():
-    """Create validation/test ImageDataGenerator without augmentation."""
-    return ImageDataGenerator(preprocessing_function=preprocess_grayscale_image)
-
-
-def build_transfer_eval_datagen():
-    """Validation/test datagen for transfer models with RGB tensors."""
+def build_transfer_eval_datagen() -> ImageDataGenerator:
+    """Validation/test datagen using shared EfficientNet preprocessing."""
     return ImageDataGenerator(preprocessing_function=preprocess_rgb_for_transfer)
 
 
 def create_flow_from_directory(
-    datagen,
-    directory,
-    target_size,
-    batch_size,
-    subset=None,
-    color_mode="grayscale",
-    shuffle=True,
+    datagen: ImageDataGenerator,
+    directory: str,
+    target_size: Tuple[int, int],
+    batch_size: int,
+    subset: str | None = None,
+    color_mode: str = "rgb",
+    shuffle: bool = True,
 ):
-    """Shared helper to keep class ordering and generator params consistent."""
+    """Shared directory-flow helper to keep class order fixed across splits."""
     return datagen.flow_from_directory(
         directory=directory,
         target_size=target_size,
@@ -119,27 +78,25 @@ def create_flow_from_directory(
     )
 
 
-def preprocess_face(face_bgr, target_size=(48, 48), model_type="cnn"):
-    """Preprocess a face crop for model inference."""
-    model_type = model_type.lower()
-    if model_type in {"resnet", "transfer", "efficientnet"}:
+def preprocess_face(face_bgr: np.ndarray, target_size: Tuple[int, int] = EFFICIENTNET_INPUT_SIZE, model_type: str = "efficientnet"):
+    """Preprocess a BGR face crop for inference."""
+    model_key = str(model_type).lower()
+
+    if model_key in {"resnet", "transfer", "efficientnet", "efficientnetb3"}:
         face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-        face_rgb = cv2.resize(face_rgb, target_size)
-        face = preprocess_rgb_for_transfer(face_rgb)
-    else:
-        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, target_size)
-        gray = _equalize_grayscale(gray)
-        face = gray.astype("float32") / 255.0
-        face = np.expand_dims(face, axis=-1)
+        x = preprocess_rgb_for_transfer(face_rgb, target_size=target_size)
+        return np.expand_dims(x, axis=0)
 
-    face = np.expand_dims(face, axis=0)
-    return face
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (target_size[1], target_size[0]))
+    gray = gray.astype("float32") / 255.0
+    gray = np.expand_dims(gray, axis=-1)
+    return np.expand_dims(gray, axis=0)
 
 
-def compute_generator_class_weights(train_generator):
-    """Compute class weights from generator labels to reduce class imbalance."""
+def compute_generator_class_weights(train_generator, max_cap: float = 5.0):
+    """Compute balanced class weights with optional max cap for stability."""
     labels = train_generator.classes
     class_ids = np.unique(labels)
     weights = compute_class_weight(class_weight="balanced", classes=class_ids, y=labels)
-    return {int(cid): float(w) for cid, w in zip(class_ids, weights)}
+    return {int(cid): float(min(weight, max_cap)) for cid, weight in zip(class_ids, weights)}

@@ -44,12 +44,17 @@ DETECTION_INTERVAL = 2
 FACE_DETECTOR_BACKEND = os.environ.get("FACE_DETECTOR_BACKEND", "haar")
 
 ARTIFACTS_DIR = os.path.join(BASE_DIR, "artifacts")
-ROOT_BEST_MODEL_PATH = os.path.join(PROJECT_DIR, "best_model.h5")
-BEST_MODEL_PATH = ROOT_BEST_MODEL_PATH if os.path.exists(ROOT_BEST_MODEL_PATH) else os.path.join(ARTIFACTS_DIR, "best_model.h5")
+ROOT_BEST_MODEL_KERAS_PATH = os.path.join(PROJECT_DIR, "best_model.keras")
+LEGACY_ROOT_BEST_MODEL_H5_PATH = os.path.join(PROJECT_DIR, "best_model.h5")
+if os.path.exists(ROOT_BEST_MODEL_KERAS_PATH):
+    BEST_MODEL_PATH = ROOT_BEST_MODEL_KERAS_PATH
+else:
+    BEST_MODEL_PATH = os.path.join(ARTIFACTS_DIR, "best_model.keras")
 TRAINING_HISTORY_PLOT = os.path.join(ARTIFACTS_DIR, "training_history.png")
 CNN_MODEL_PATH = os.path.join(ARTIFACTS_DIR, "cnn_model.h5")
 RESNET_MODEL_PATH = os.path.join(ARTIFACTS_DIR, "resnet50_model.h5")
-EFFICIENTNET_MODEL_PATH = os.path.join(ARTIFACTS_DIR, "efficientnet_model.h5")
+EFFICIENTNET_MODEL_PATH = os.path.join(ARTIFACTS_DIR, "efficientnet_b3_best.keras")
+LEGACY_EFFICIENTNET_MODEL_PATH = os.path.join(ARTIFACTS_DIR, "efficientnet_model.h5")
 CONFUSION_MATRIX_PATH = os.path.join(ARTIFACTS_DIR, "confusion_matrix.png")
 CLASSIFICATION_REPORT_PATH = os.path.join(ARTIFACTS_DIR, "classification_report.txt")
 TRAINING_LOG_PATH = os.path.join(ARTIFACTS_DIR, "training_log.txt")

@@ -9,7 +9,7 @@ BACKEND_DIR = os.path.dirname(CURRENT_DIR)
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-from inference.inference_engine import init_face_detector, load_model_safe, predict_frame
+from inference.inference_engine import find_latest_model, init_face_detector, load_model_safe, predict_frame
 
 
 def main():
@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--image", required=True, help="Path to the input image.")
     parser.add_argument(
         "--model",
-        default=os.path.join(BACKEND_DIR, "artifacts", "best_model.h5"),
+        default=None,
         help="Path to trained model file.",
     )
     parser.add_argument("--threshold", type=float, default=0.6, help="Confidence threshold.")
@@ -27,7 +27,7 @@ def main():
     if image is None:
         raise FileNotFoundError(f"Could not read image: {args.image}")
 
-    model_path = args.model
+    model_path = args.model or find_latest_model()
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
@@ -57,7 +57,12 @@ def main():
             f"- Face {face['id']}: bbox=({x},{y},{w},{h}), emotion={face['emotion']}, "
             f"confidence={face['confidence'] * 100.0:.2f}%"
         )
-        print(f"  Probabilities: {face['probabilities']}")
+        probabilities = face.get("probabilityMap") or {}
+        if probabilities:
+            as_percent = {k: round(float(v) * 100.0, 2) for k, v in probabilities.items()}
+            print(f"  Probabilities (%): {as_percent}")
+        else:
+            print(f"  Probabilities: {face['probabilities']}")
 
     print(f"\nPrimary Probability Vector: {probs.astype(float).tolist()}")
 
