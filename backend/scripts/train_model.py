@@ -26,9 +26,8 @@ from tensorflow.keras.layers import (
     RandomRotation,
     RandomZoom,
 )
-from tensorflow.keras.mixed_precision import set_global_policy
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+ImageDataGenerator = tf.keras.preprocessing.image.ImageDataGenerator
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(CURRENT_DIR)
@@ -94,12 +93,12 @@ def configure_gpu() -> bool:
                 tf.config.experimental.set_memory_growth(gpu, True)
             except RuntimeError:
                 pass
-        set_global_policy("mixed_float16")
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
         write_log(f"TensorFlow detected {len(gpus)} GPU(s). Memory growth enabled.")
         write_log("Mixed precision enabled: mixed_float16")
         return True
 
-    set_global_policy("float32")
+    tf.keras.mixed_precision.set_global_policy("float32")
     write_log("No GPU detected. Training will run on CPU.")
     write_log("Mixed precision disabled (float32 policy).")
     return False
@@ -219,7 +218,7 @@ def build_model(learning_rate: float, freeze_base: bool = True) -> Tuple[Model, 
 
     model = Model(inputs=inputs, outputs=outputs, name="efficientnetb3_emotion")
     model.compile(
-        optimizer=Adam(learning_rate=learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss=_focal_loss(),
         metrics=["accuracy"],
     )
@@ -381,7 +380,7 @@ def main() -> None:
     write_log(f"Stage 2: fine-tuning last {config.unfreeze_last_n} layers")
     unfreeze_last_layers(backbone, last_n=config.unfreeze_last_n)
     model.compile(
-        optimizer=Adam(learning_rate=config.stage2_lr),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.stage2_lr),
         loss=_focal_loss(),
         metrics=["accuracy"],
     )
