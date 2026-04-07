@@ -5,7 +5,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input as efficientnetv2_preprocess
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 try:
@@ -33,20 +33,27 @@ def _to_rgb(image: np.ndarray) -> np.ndarray:
 
 
 def preprocess_rgb_for_transfer(image: np.ndarray, target_size: Tuple[int, int] = EFFICIENTNET_INPUT_SIZE) -> np.ndarray:
-    """Shared preprocessing for EfficientNet training, validation, and inference."""
+    """Shared preprocessing for transfer models (EfficientNetV2 family)."""
     x = _to_rgb(image).astype("float32")
 
     if x.shape[0] != target_size[0] or x.shape[1] != target_size[1]:
         interp = cv2.INTER_AREA if (x.shape[0] > target_size[0] or x.shape[1] > target_size[1]) else cv2.INTER_LINEAR
         x = cv2.resize(x, (target_size[1], target_size[0]), interpolation=interp)
 
-    return efficientnet_preprocess(x)
+    return efficientnetv2_preprocess(x)
 
 
 def build_transfer_train_datagen(validation_split: float = 0.2) -> ImageDataGenerator:
-    """Transfer-learning datagen using shared EfficientNet preprocessing."""
+    """Training datagen with FER-focused augmentation for transfer learning."""
     return ImageDataGenerator(
         preprocessing_function=preprocess_rgb_for_transfer,
+        rotation_range=25,
+        zoom_range=0.20,
+        width_shift_range=0.15,
+        height_shift_range=0.15,
+        horizontal_flip=True,
+        brightness_range=(0.8, 1.2),
+        fill_mode="nearest",
         validation_split=validation_split,
     )
 
@@ -54,6 +61,16 @@ def build_transfer_train_datagen(validation_split: float = 0.2) -> ImageDataGene
 def build_transfer_eval_datagen() -> ImageDataGenerator:
     """Validation/test datagen using shared EfficientNet preprocessing."""
     return ImageDataGenerator(preprocessing_function=preprocess_rgb_for_transfer)
+
+
+def build_train_datagen(validation_split: float = 0.2) -> ImageDataGenerator:
+    """Backward-compatible alias for transfer training datagen."""
+    return build_transfer_train_datagen(validation_split=validation_split)
+
+
+def build_eval_datagen() -> ImageDataGenerator:
+    """Backward-compatible alias for transfer validation/test datagen."""
+    return build_transfer_eval_datagen()
 
 
 def create_flow_from_directory(
@@ -82,7 +99,7 @@ def preprocess_face(face_bgr: np.ndarray, target_size: Tuple[int, int] = EFFICIE
     """Preprocess a BGR face crop for inference."""
     model_key = str(model_type).lower()
 
-    if model_key in {"resnet", "transfer", "efficientnet", "efficientnetb3"}:
+    if model_key in {"resnet", "transfer", "efficientnet", "efficientnetb3", "efficientnetv2", "convnext", "vit"}:
         face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
         x = preprocess_rgb_for_transfer(face_rgb, target_size=target_size)
         return np.expand_dims(x, axis=0)
@@ -99,4 +116,9 @@ def compute_generator_class_weights(train_generator, max_cap: float = 5.0):
     labels = train_generator.classes
     class_ids = np.unique(labels)
     weights = compute_class_weight(class_weight="balanced", classes=class_ids, y=labels)
-    return {int(cid): float(min(weight, max_cap)) for cid, weight in zip(class_ids, weights)}
+    capped = {int(cid): float(min(weight, max_cap)) for cid, weight in zip(class_ids, weights)}
+
+    full = {}
+    for idx in range(len(EMOTION_CLASSES)):
+        full[idx] = float(capped.get(idx, 1.0))
+    return full
