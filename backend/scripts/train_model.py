@@ -24,6 +24,7 @@ from config import (  # noqa: E402
     BEST_MODEL_PATH,
     CLASSIFICATION_REPORT_PATH,
     CONFUSION_MATRIX_PATH,
+    DATASET_DIR,
     EFFICIENTNET_MODEL_PATH,
     EMOTION_CLASSES,
     TEST_DIR,
@@ -63,9 +64,19 @@ class TrainConfig:
 def ensure_paths() -> None:
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
     if not os.path.isdir(TRAIN_DIR):
-        raise FileNotFoundError(f"Train directory not found: {TRAIN_DIR}")
+        raise FileNotFoundError(
+            "Train directory not found: "
+            f"{TRAIN_DIR}. Resolved DATASET_DIR={DATASET_DIR}. "
+            "If running on Kaggle, set FER_DATASET_DIR to the mounted dataset root "
+            "that contains both 'train' and 'test'."
+        )
     if not os.path.isdir(TEST_DIR):
-        raise FileNotFoundError(f"Test directory not found: {TEST_DIR}")
+        raise FileNotFoundError(
+            "Test directory not found: "
+            f"{TEST_DIR}. Resolved DATASET_DIR={DATASET_DIR}. "
+            "If running on Kaggle, set FER_DATASET_DIR to the mounted dataset root "
+            "that contains both 'train' and 'test'."
+        )
 
 
 def reset_log() -> None:

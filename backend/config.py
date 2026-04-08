@@ -17,15 +17,77 @@ NUM_CLASSES = len(EMOTION_CLASSES)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 
+def _has_train_test_dirs(path: str) -> bool:
+    return os.path.isdir(os.path.join(path, "train")) and os.path.isdir(os.path.join(path, "test"))
+
+
+def _normalize_dataset_dir(path: str) -> str:
+    """Accept dataset root or direct train/test split path and normalize to dataset root."""
+    if not path:
+        return ""
+
+    normalized = os.path.abspath(path)
+    if _has_train_test_dirs(normalized):
+        return normalized
+
+    split_name = os.path.basename(normalized).lower()
+    parent = os.path.dirname(normalized)
+    if split_name in {"train", "test"} and _has_train_test_dirs(parent):
+        return parent
+
+    return ""
+
+
+def _discover_kaggle_dataset_dir() -> str:
+    kaggle_input_root = "/kaggle/input"
+    if not os.path.isdir(kaggle_input_root):
+        return ""
+
+    try:
+        level1 = sorted(os.listdir(kaggle_input_root))
+    except OSError:
+        return ""
+
+    # Common Kaggle mounts are one or two levels below /kaggle/input.
+    for name in level1:
+        candidate = os.path.join(kaggle_input_root, name)
+        if _has_train_test_dirs(candidate):
+            return candidate
+
+    for name in level1:
+        parent = os.path.join(kaggle_input_root, name)
+        if not os.path.isdir(parent):
+            continue
+        try:
+            level2 = sorted(os.listdir(parent))
+        except OSError:
+            continue
+        for child in level2:
+            candidate = os.path.join(parent, child)
+            if _has_train_test_dirs(candidate):
+                return candidate
+
+    return ""
+
+
 # Dataset resolution priority:
-# 1) FER_DATASET_DIR env var
+# 1) FER_DATASET_DIR env var (dataset root, or direct train/test path)
 # 2) Local backend path: ./dataset
 # 3) Legacy project path: ../dataset
+# 4) Kaggle auto-discovery under /kaggle/input
 LOCAL_DATASET = os.path.join(BASE_DIR, "dataset")
 LEGACY_PROJECT_DATASET = os.path.join(PROJECT_DIR, "dataset")
-DATASET_DIR = os.environ.get("FER_DATASET_DIR", LOCAL_DATASET)
-if not os.path.isdir(DATASET_DIR):
-    DATASET_DIR = LEGACY_PROJECT_DATASET
+ENV_DATASET = os.environ.get("FER_DATASET_DIR", "").strip()
+
+DATASET_DIR = ""
+for candidate in [ENV_DATASET, LOCAL_DATASET, LEGACY_PROJECT_DATASET, _discover_kaggle_dataset_dir()]:
+    resolved = _normalize_dataset_dir(candidate)
+    if resolved:
+        DATASET_DIR = resolved
+        break
+
+if not DATASET_DIR:
+    DATASET_DIR = os.path.abspath(ENV_DATASET or LOCAL_DATASET)
 
 TRAIN_DIR = os.path.join(DATASET_DIR, "train")
 TEST_DIR = os.path.join(DATASET_DIR, "test")
