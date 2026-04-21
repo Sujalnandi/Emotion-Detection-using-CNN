@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 import numpy as np
 
-from backend.config import CONFIDENCE_THRESHOLD, DETECTION_INTERVAL
+from backend.config import CONFIDENCE_THRESHOLD, DETECTION_CONFIDENCE_THRESHOLD, DETECTION_INTERVAL
 from backend.inference.inference_engine import EMOTIONS, EmotionPredictor, predict_frame
 
 
@@ -62,6 +62,7 @@ def infer_frame(
         predictor=smoother if use_smoothing else None,
         confidence_threshold=CONFIDENCE_THRESHOLD,
         detection_interval=DETECTION_INTERVAL,
+        detection_confidence_threshold=DETECTION_CONFIDENCE_THRESHOLD,
         detector_size=(640, 480) if use_smoothing else None,
     )
 
