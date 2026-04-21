@@ -20,3 +20,19 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 .vscode/settings.json
+
+# Virtual Environment
+.venv/
+.venv312/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large files
+*.h5
+*.keras
+
+# OS files
+.DS_Store
