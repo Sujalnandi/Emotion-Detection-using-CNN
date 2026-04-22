@@ -1,0 +1,43 @@
+=== Improved FER Training Pipeline ===
+Device: GPU (2 GPU(s) visible), mixed precision: ON
+TensorFlow GPUs: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU'), PhysicalDevice(name='/physical_device:GPU:1', device_type='GPU')]
+GPU[0] details: {'compute_capability': (7, 5), 'device_name': 'Tesla T4'}
+GPU[1] details: {'compute_capability': (7, 5), 'device_name': 'Tesla T4'}
+Backbone: efficientnetb0
+Pipeline: tfdata
+Stage-2 unfreeze layers: 30
+Train directory: /kaggle/input/datasets/sujalnandi/emotion-data/dataset/train
+Test directory: /kaggle/input/datasets/sujalnandi/emotion-data/dataset/test
+Input resolution: 224x224 RGB
+Epoch plan -> stage1: 30, stage2: 70, total: 100
+Computed class weights: {0: 1.0196217703986505, 1: 9.03896103896104, 2: 0.998825831702544, 3: 0.5644491410877098, 4: 0.8275265717888669, 5: 0.8558014755197854, 6: 1.3177280550774526}
+
+Stage 1: training attention head with frozen backbone...
+
+Stage 2: fine-tuning top backbone layers with low learning rate...
+Best validation accuracy: 0.6769
+Saved best model to: /kaggle/working/Emotion-Detection-using-CNN/backend/artifacts/best_model.h5
+efficientnetb0 transfer test_loss: 0.2696
+efficientnetb0 transfer test_accuracy: 0.5872
+Final test accuracy: 0.5872
+Saved training plot to: /kaggle/working/Emotion-Detection-using-CNN/backend/artifacts/training_history.png
+
+Classification Report:
+              precision    recall  f1-score   support
+
+       Angry     0.5225    0.4238    0.4680       958
+     Disgust     0.3836    0.5495    0.4519       111
+        Fear     0.4427    0.2715    0.3366      1024
+       Happy     0.8138    0.8129    0.8133      1774
+     Neutral     0.4902    0.6869    0.5721      1233
+         Sad     0.4844    0.4362    0.4591      1247
+    Surprise     0.6428    0.7665    0.6992       831
+
+    accuracy                         0.5872      7178
+   macro avg     0.5400    0.5639    0.5429      7178
+weighted avg     0.5827    0.5872    0.5774      7178
+
+Saved confusion matrix to: /kaggle/working/Emotion-Detection-using-CNN/backend/artifacts/confusion_matrix.png
+Saved classification report to: /kaggle/working/Emotion-Detection-using-CNN/backend/artifacts/classification_report.txt
+Saved training log to: /kaggle/working/Emotion-Detection-using-CNN/backend/artifacts/training_log.txt
+Target not reached in this run. Re-run with --model efficientnetb0 and tune --freeze-ratio/--fine-tune-lr.
