@@ -181,7 +181,7 @@ def main():
     )
     parser.add_argument(
         "--detector-backend",
-        choices=["mtcnn", "auto"],
+        choices=["mediapipe", "mtcnn", "auto"],
         default="auto",
         help="Face detector backend to use (default: auto -> config preference).",
     )
@@ -199,6 +199,11 @@ def main():
         "--debug-predictions",
         action="store_true",
         help="Print per-face raw probabilities, selected class, confidence, and top-3.",
+    )
+    parser.add_argument(
+        "--debug-boxes",
+        action="store_true",
+        help="Print per-face bounding box coordinates (x, y, w, h) for alignment debugging.",
     )
     parser.add_argument(
         "--debug-crop",
@@ -266,6 +271,7 @@ def main():
     print("  Detection interval: every frame")
     print("  Label policy: always top-1 emotion, low-confidence guidance below 0.4")
     print(f"  Debug face crop: {'enabled' if args.debug_crop else 'disabled'}")
+    print(f"  Debug face boxes: {'enabled' if args.debug_boxes else 'disabled'}")
     if args.adaptive_skip:
         print(f"  Adaptive skip: enabled (target_fps={args.target_fps:.1f}, max_skip={max(1, int(args.max_skip))})")
     else:
@@ -367,6 +373,13 @@ def main():
                 color = _confidence_color(confidence)
                 _draw_face_overlay(annotated, bbox=bbox, label=label, color=color)
                 live_overlays.append((bbox, label, color))
+
+                if args.debug_boxes:
+                    x, y, w, h = bbox
+                    print(
+                        f"Frame {frame_count + 1} | Face {face_id} | "
+                        f"bbox=(x={x}, y={y}, w={w}, h={h})"
+                    )
 
                 if args.debug_predictions:
                     top3 = _top3_from_probs(smoothed_probs, EMOTIONS)

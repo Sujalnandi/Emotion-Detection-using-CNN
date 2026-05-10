@@ -1,7 +1,7 @@
-tensorflow>=2.12.0
-tf-keras>=2.21.0
+tensorflow-intel==2.18.0; platform_system == "Windows"
+tensorflow==2.18.0; platform_system != "Windows"
 opencv-python>=4.8.0
-numpy>=1.23.0
+numpy>=1.26.0,<2.0
 matplotlib>=3.7.0
 scikit-learn>=1.3.0
 seaborn>=0.12.0
@@ -10,3 +10,4 @@ fastapi>=0.115.0
 uvicorn>=0.30.0
 python-multipart>=0.0.9
 mtcnn>=0.1.1
+mediapipe>=0.10.14

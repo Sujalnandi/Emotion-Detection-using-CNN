@@ -104,7 +104,7 @@ PREDICTION_SMOOTHING_WINDOW = 12
 CONFIDENCE_THRESHOLD = 0.6
 DETECTION_INTERVAL = 2
 DETECTION_CONFIDENCE_THRESHOLD = float(os.environ.get("DETECTION_CONFIDENCE_THRESHOLD", "0.90"))
-FACE_DETECTOR_BACKEND = os.environ.get("FACE_DETECTOR_BACKEND", "mtcnn")
+FACE_DETECTOR_BACKEND = os.environ.get("FACE_DETECTOR_BACKEND", "auto")
 
 ARTIFACTS_DIR = os.path.join(BASE_DIR, "artifacts")
 ROOT_BEST_MODEL_KERAS_PATH = os.path.join(PROJECT_DIR, "best_model.keras")
@@ -122,4 +122,13 @@ CONFUSION_MATRIX_PATH = os.path.join(ARTIFACTS_DIR, "confusion_matrix.png")
 CLASSIFICATION_REPORT_PATH = os.path.join(ARTIFACTS_DIR, "classification_report.txt")
 TRAINING_LOG_PATH = os.path.join(ARTIFACTS_DIR, "training_log.txt")
 
-HAAR_CASCADE_PATH = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+def _resolve_haar_cascade_path() -> str:
+    data_dir = getattr(getattr(cv2, "data", None), "haarcascades", None)
+    if data_dir:
+        return os.path.join(data_dir, "haarcascade_frontalface_default.xml")
+
+    cv2_dir = os.path.dirname(cv2.__file__)
+    return os.path.join(cv2_dir, "data", "haarcascade_frontalface_default.xml")
+
+
+HAAR_CASCADE_PATH = _resolve_haar_cascade_path()

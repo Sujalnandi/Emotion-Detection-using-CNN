@@ -2,11 +2,10 @@ import logging
 import os
 from collections import deque
 from glob import glob
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
-from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess_input
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import load_model
 
@@ -15,13 +14,25 @@ try:
         BEST_MODEL_PATH,
         DETECTION_CONFIDENCE_THRESHOLD,
         EMOTION_CLASSES,
+        FACE_DETECTOR_BACKEND,
     )
 except ModuleNotFoundError:
     from backend.config import (
         BEST_MODEL_PATH,
         DETECTION_CONFIDENCE_THRESHOLD,
         EMOTION_CLASSES,
+        FACE_DETECTOR_BACKEND,
     )
+
+try:
+    from preprocessing.preprocess import preprocess_rgb_for_transfer
+except ModuleNotFoundError:
+    from backend.preprocessing.preprocess import preprocess_rgb_for_transfer
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
 
 MTCNN = None
 try:
@@ -30,12 +41,13 @@ except ImportError:
     MTCNN = None
 
 _GLOBAL_MTCNN_DETECTOR = None
+_GLOBAL_MEDIAPIPE_DETECTOR = None
 
 logger = logging.getLogger("backend.inference_engine")
 
 EMOTIONS = EMOTION_CLASSES
 INPUT_SIZE = (48, 48)
-FACE_CROP_MARGIN = 0.2
+FACE_CROP_MARGIN = 0.15
 
 EMOTION_COLORS = {
     "angry": (36, 28, 237),
@@ -60,6 +72,7 @@ CONFIDENCE_COLORS = {
 _PREPROCESS_RANGE_WARNED = False
 _SOFTMAX_WARNED = False
 _FLAT_PROBS_WARNED = False
+_FACE_DETECTOR_FALLBACK_WARNED = False
 
 
 def _confidence_level(confidence: float) -> str:
@@ -171,9 +184,11 @@ class EmotionPredictor:
         self._switch_vote_ratio = 0.6
         self._track_iou_threshold = 0.35
         self._max_missed_frames = max(3, self.smoothing_window)
+        self._bbox_ema_alpha = 0.55
 
         self._history_by_face: Dict[int, Deque[np.ndarray]] = {}
         self._ema_probs_by_face: Dict[int, np.ndarray] = {}
+        self._bbox_ema_by_face: Dict[int, np.ndarray] = {}
         self._stable_label_by_face: Dict[int, str] = {}
         self._stable_confidence_by_face: Dict[int, float] = {}
         self._label_history_by_face: Dict[int, Deque[str]] = {}
@@ -188,6 +203,7 @@ class EmotionPredictor:
     def reset(self) -> None:
         self._history_by_face.clear()
         self._ema_probs_by_face.clear()
+        self._bbox_ema_by_face.clear()
         self._stable_label_by_face.clear()
         self._stable_confidence_by_face.clear()
         self._label_history_by_face.clear()
@@ -236,6 +252,7 @@ class EmotionPredictor:
     def _clear_face_state(self, face_id: int) -> None:
         self._history_by_face.pop(face_id, None)
         self._ema_probs_by_face.pop(face_id, None)
+        self._bbox_ema_by_face.pop(face_id, None)
         self._stable_label_by_face.pop(face_id, None)
         self._stable_confidence_by_face.pop(face_id, None)
         self._label_history_by_face.pop(face_id, None)
@@ -290,11 +307,30 @@ class EmotionPredictor:
                 self._next_track_id += 1
                 assignments[box_idx] = track_id
 
-            self._track_boxes[track_id] = boxes[box_idx]
+            self._track_boxes[track_id] = self._smooth_bbox(track_id, boxes[box_idx])
             self._track_missed[track_id] = 0
 
         self._prune_missing_tracks()
         return assignments
+
+    def _smooth_bbox(self, face_id: int, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        current = np.asarray(bbox, dtype=np.float32)
+        previous = self._bbox_ema_by_face.get(face_id)
+        if previous is None:
+            smoothed = current
+        else:
+            smoothed = (self._bbox_ema_alpha * current) + ((1.0 - self._bbox_ema_alpha) * previous)
+
+        self._bbox_ema_by_face[face_id] = smoothed
+        x, y, w, h = [int(round(float(v))) for v in smoothed.tolist()]
+        return max(0, x), max(0, y), max(1, w), max(1, h)
+
+    def get_track_box(self, face_id: int, fallback: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        box = self._track_boxes.get(int(face_id))
+        if box is None:
+            return fallback
+        x, y, w, h = box
+        return max(0, int(x)), max(0, int(y)), max(1, int(w)), max(1, int(h))
 
     def _append_history(self, face_id: int, label: str, confidence: float) -> None:
         if face_id not in self._label_history_by_face:
@@ -311,7 +347,9 @@ class EmotionPredictor:
         self._history_by_face[face_id].append(probs)
 
         mean_probs = np.mean(np.stack(list(self._history_by_face[face_id]), axis=0), axis=0)
-        prev_ema = self._ema_probs_by_face.get(face_id, mean_probs)
+        prev_ema = self._ema_probs_by_face.get(face_id)
+        if prev_ema is None:
+            prev_ema = mean_probs
         ema_probs = (self._ema_alpha * mean_probs) + ((1.0 - self._ema_alpha) * prev_ema)
         self._ema_probs_by_face[face_id] = ema_probs.astype(np.float32)
         return self._ema_probs_by_face[face_id]
@@ -424,19 +462,52 @@ def load_model_safe(model_path: Optional[str] = None):
 
 
 def init_face_detector(cascade_path: Optional[str] = None, backend_preference: Optional[str] = None):
-    """Initialize a global MTCNN detector and reuse it across requests/frames."""
-    del cascade_path, backend_preference  # Kept for backward-compatible call signatures.
+    """Initialize a robust face detector, preferring MediaPipe and falling back to MTCNN."""
+    del cascade_path  # Kept for backward-compatible call signatures.
 
+    preferred = str(backend_preference or FACE_DETECTOR_BACKEND or "auto").strip().lower()
+    if preferred not in {"auto", "mediapipe", "mtcnn"}:
+        preferred = "auto"
+
+    if preferred == "auto":
+        backend_order = ["mediapipe", "mtcnn"]
+    else:
+        backend_order = [preferred]
+
+    global _GLOBAL_MEDIAPIPE_DETECTOR
     global _GLOBAL_MTCNN_DETECTOR
-    if _GLOBAL_MTCNN_DETECTOR is None:
-        if MTCNN is None:
-            raise RuntimeError(
-                "MTCNN is not available. Install it with: pip install mtcnn"
-            )
-        logger.info("Initializing global MTCNN detector backend")
-        _GLOBAL_MTCNN_DETECTOR = MTCNN()
+    global _FACE_DETECTOR_FALLBACK_WARNED
 
-    return {"backend": "mtcnn", "detector": _GLOBAL_MTCNN_DETECTOR}
+    for backend in backend_order:
+        if backend == "mediapipe":
+            if mp is None:
+                continue
+            if _GLOBAL_MEDIAPIPE_DETECTOR is None:
+                logger.info("Initializing global MediaPipe face detector backend")
+                _GLOBAL_MEDIAPIPE_DETECTOR = mp.solutions.face_detection.FaceDetection(
+                    model_selection=1,
+                    min_detection_confidence=float(DETECTION_CONFIDENCE_THRESHOLD),
+                )
+            return {"backend": "mediapipe", "detector": _GLOBAL_MEDIAPIPE_DETECTOR}
+
+        if backend == "mtcnn":
+            if MTCNN is None:
+                continue
+            if _GLOBAL_MTCNN_DETECTOR is None:
+                logger.info("Initializing global MTCNN detector backend")
+                _GLOBAL_MTCNN_DETECTOR = MTCNN()
+            return {"backend": "mtcnn", "detector": _GLOBAL_MTCNN_DETECTOR}
+
+    if not _FACE_DETECTOR_FALLBACK_WARNED:
+        logger.warning(
+            "No robust detector available (MediaPipe/MTCNN). "
+            "Install one with: pip install mediapipe mtcnn"
+        )
+        _FACE_DETECTOR_FALLBACK_WARNED = True
+
+    raise RuntimeError(
+        "No supported face detector backend available. Install mediapipe or mtcnn."
+    )
 
 
 def _rotate_by_eyes(face_bgr: np.ndarray, left_eye: Tuple[int, int], right_eye: Tuple[int, int]) -> np.ndarray:
@@ -449,21 +520,27 @@ def _rotate_by_eyes(face_bgr: np.ndarray, left_eye: Tuple[int, int], right_eye: 
     return cv2.warpAffine(face_bgr, matrix, (w, h), flags=cv2.INTER_LINEAR)
 
 
-def _extract_faces(detector_bundle, frame_bgr: np.ndarray):
-    detector = detector_bundle.get("detector")
-    if detector is None:
-        return []
+def _enhance_for_detection(frame_bgr: np.ndarray) -> np.ndarray:
+    """Improve detection robustness under challenging lighting without altering model inputs."""
+    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    y = clahe.apply(y)
+    merged = cv2.merge((y, cr, cb))
+    return cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
 
+
+def _extract_faces_mtcnn(detector, frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
     frame_h, frame_w = frame_bgr.shape[:2]
-
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
     try:
         results = detector.detect_faces(rgb)
     except Exception as exc:
         logger.warning("MTCNN detection failed on current frame: %s", exc)
         return []
 
-    faces = []
+    faces: List[Dict[str, Any]] = []
     for item in results or []:
         if not isinstance(item, dict):
             continue
@@ -476,7 +553,6 @@ def _extract_faces(detector_bundle, frame_bgr: np.ndarray):
         if w == 0 or h == 0:
             continue
 
-        # MTCNN returns [x, y, w, h], and x/y may be negative at frame borders.
         if w < 0:
             x = x + w
             w = abs(w)
@@ -495,7 +571,7 @@ def _extract_faces(detector_bundle, frame_bgr: np.ndarray):
             continue
 
         keypoints_raw = item.get("keypoints", {})
-        keypoints = {}
+        keypoints: Dict[str, Tuple[int, int]] = {}
         if isinstance(keypoints_raw, dict):
             for name in ("left_eye", "right_eye"):
                 point = keypoints_raw.get(name)
@@ -509,7 +585,160 @@ def _extract_faces(detector_bundle, frame_bgr: np.ndarray):
                 "score": float(item.get("confidence", 0.0)),
             }
         )
+
     return faces
+
+
+def _refine_bbox_from_keypoints(
+    bbox: Tuple[int, int, int, int],
+    keypoints: Dict[str, Tuple[int, int]],
+    frame_w: int,
+    frame_h: int,
+) -> Tuple[int, int, int, int]:
+    x, y, w, h = bbox
+    if w <= 1 or h <= 1:
+        return bbox
+
+    left_eye = keypoints.get("left_eye")
+    right_eye = keypoints.get("right_eye")
+    mouth = keypoints.get("mouth_center")
+    left_ear = keypoints.get("left_ear")
+    right_ear = keypoints.get("right_ear")
+
+    x1 = int(x)
+    y1 = int(y)
+    x2 = int(x + w)
+    y2 = int(y + h)
+
+    if left_ear is not None and right_ear is not None:
+        ear_left = min(int(left_ear[0]), int(right_ear[0]))
+        ear_right = max(int(left_ear[0]), int(right_ear[0]))
+        ear_span = max(1, ear_right - ear_left)
+        ear_pad = int(round(ear_span * 0.12))
+        x1 = min(x1, ear_left - ear_pad)
+        x2 = max(x2, ear_right + ear_pad)
+
+    if left_eye is not None and right_eye is not None and mouth is not None:
+        eye_y = int(round((float(left_eye[1]) + float(right_eye[1])) * 0.5))
+        mouth_y = int(mouth[1])
+        eye_to_mouth = max(1.0, float(mouth_y - eye_y))
+
+        est_h = max(float(h), eye_to_mouth / 0.42)
+        top = int(round(float(eye_y) - (0.35 * est_h)))
+        bottom = int(round(float(mouth_y) + (0.23 * est_h)))
+        refined_h = max(1, bottom - top)
+
+        eye_dist = max(1.0, float(abs(int(right_eye[0]) - int(left_eye[0]))))
+        est_w = max(float(w), eye_dist * 2.2)
+        cx = int(round((float(left_eye[0]) + float(right_eye[0])) * 0.5))
+        left = int(round(float(cx) - (est_w * 0.5)))
+        right = int(round(float(cx) + (est_w * 0.5)))
+
+        # Blend with detector box to avoid overreacting to noisy keypoints.
+        blend = 0.6
+        x1 = int(round((blend * left) + ((1.0 - blend) * x1)))
+        x2 = int(round((blend * right) + ((1.0 - blend) * x2)))
+        y1 = int(round((blend * top) + ((1.0 - blend) * y1)))
+        y2 = int(round((blend * (top + refined_h)) + ((1.0 - blend) * y2)))
+
+    x1 = max(0, min(frame_w - 1, x1))
+    y1 = max(0, min(frame_h - 1, y1))
+    x2 = max(x1 + 1, min(frame_w, x2))
+    y2 = max(y1 + 1, min(frame_h, y2))
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def _extract_faces_mediapipe(detector, frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    frame_h, frame_w = frame_bgr.shape[:2]
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+    try:
+        result = detector.process(rgb)
+    except Exception as exc:
+        logger.warning("MediaPipe detection failed on current frame: %s", exc)
+        return []
+
+    detections = getattr(result, "detections", None) or []
+    faces: List[Dict[str, Any]] = []
+    for det in detections:
+        location = getattr(det, "location_data", None)
+        if location is None:
+            continue
+
+        rel_box = getattr(location, "relative_bounding_box", None)
+        if rel_box is None:
+            continue
+
+        x = int(rel_box.xmin * frame_w)
+        y = int(rel_box.ymin * frame_h)
+        w = int(rel_box.width * frame_w)
+        h = int(rel_box.height * frame_h)
+        if w <= 1 or h <= 1:
+            continue
+
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(frame_w, x + w)
+        y2 = min(frame_h, y + h)
+        clipped_w = x2 - x1
+        clipped_h = y2 - y1
+        if clipped_w <= 1 or clipped_h <= 1:
+            continue
+
+        keypoints: Dict[str, Tuple[int, int]] = {}
+        rel_keypoints = list(getattr(location, "relative_keypoints", []) or [])
+        keypoint_names = [
+            "right_eye",
+            "left_eye",
+            "nose_tip",
+            "mouth_center",
+            "right_ear",
+            "left_ear",
+        ]
+        for idx, keypoint in enumerate(rel_keypoints):
+            if idx >= len(keypoint_names):
+                break
+            ex = int(float(keypoint.x) * frame_w)
+            ey = int(float(keypoint.y) * frame_h)
+            keypoints[keypoint_names[idx]] = (ex, ey)
+
+        if "left_eye" in keypoints and "right_eye" in keypoints:
+            lx, ly = keypoints["left_eye"]
+            rx, ry = keypoints["right_eye"]
+            if lx > rx:
+                keypoints["left_eye"] = (rx, ry)
+                keypoints["right_eye"] = (lx, ly)
+
+        refined_bbox = _refine_bbox_from_keypoints(
+            (x1, y1, clipped_w, clipped_h),
+            keypoints=keypoints,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
+
+        score_raw = getattr(det, "score", [0.0])
+        score = float(score_raw[0]) if len(score_raw) > 0 else 0.0
+        faces.append(
+            {
+                "bbox": refined_bbox,
+                "keypoints": keypoints,
+                "score": score,
+            }
+        )
+
+    return faces
+
+
+def _extract_faces(detector_bundle, frame_bgr: np.ndarray):
+    backend = str(detector_bundle.get("backend", "")).lower().strip()
+    detector = detector_bundle.get("detector")
+    if detector is None:
+        return []
+
+    if backend == "mediapipe":
+        return _extract_faces_mediapipe(detector=detector, frame_bgr=frame_bgr)
+
+    return _extract_faces_mtcnn(detector=detector, frame_bgr=frame_bgr)
 
 
 def _sanitize_bbox(
@@ -522,10 +751,14 @@ def _sanitize_bbox(
     # Expand around the detector bbox so prediction sees context, not a tight crop.
     x = max(0, int(x))
     y = max(0, int(y))
-    x1 = max(0, int(x - (w * float(margin))))
-    y1 = max(0, int(y - (h * float(margin))))
-    x2 = min(frame_w, int(x + (w * (1.0 + float(margin)))))
-    y2 = min(frame_h, int(y + (h * (1.0 + float(margin)))))
+    pad_x = w * float(margin)
+    pad_top = h * float(margin) * 1.2
+    pad_bottom = h * float(margin) * 0.8
+
+    x1 = max(0, int(round(x - pad_x)))
+    y1 = max(0, int(round(y - pad_top)))
+    x2 = min(frame_w, int(round((x + w) + pad_x)))
+    y2 = min(frame_h, int(round((y + h) + pad_bottom)))
 
     cw = x2 - x1
     ch = y2 - y1
@@ -534,17 +767,91 @@ def _sanitize_bbox(
     return x1, y1, cw, ch
 
 
+def _resize_with_aspect_ratio(image: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+    """Resize while preserving aspect ratio and pad to the exact target size."""
+    target_h, target_w = int(target_size[0]), int(target_size[1])
+    if target_h <= 0 or target_w <= 0:
+        raise ValueError("target_size must contain positive dimensions")
+
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0:
+        raise ValueError("Cannot resize empty image")
+
+    scale = min(float(target_w) / float(w), float(target_h) / float(h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
+
+    pad_x = max(0, target_w - new_w)
+    pad_y = max(0, target_h - new_h)
+    pad_left = pad_x // 2
+    pad_right = pad_x - pad_left
+    pad_top = pad_y // 2
+    pad_bottom = pad_y - pad_top
+    return cv2.copyMakeBorder(
+        resized,
+        pad_top,
+        pad_bottom,
+        pad_left,
+        pad_right,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+
+
+def _square_bbox(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    frame_w: int,
+    frame_h: int,
+) -> Tuple[int, int, int, int]:
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    side = max(width, height)
+
+    cx = x1 + (width // 2)
+    cy = y1 + (height // 2)
+
+    sx1 = cx - (side // 2)
+    sy1 = cy - (side // 2)
+    sx2 = sx1 + side
+    sy2 = sy1 + side
+
+    if sx1 < 0:
+        sx2 += -sx1
+        sx1 = 0
+    if sy1 < 0:
+        sy2 += -sy1
+        sy1 = 0
+    if sx2 > frame_w:
+        shift = sx2 - frame_w
+        sx1 = max(0, sx1 - shift)
+        sx2 = frame_w
+    if sy2 > frame_h:
+        shift = sy2 - frame_h
+        sy1 = max(0, sy1 - shift)
+        sy2 = frame_h
+
+    if sx2 <= sx1:
+        sx2 = min(frame_w, sx1 + 1)
+    if sy2 <= sy1:
+        sy2 = min(frame_h, sy1 + 1)
+    return sx1, sy1, sx2, sy2
+
+
 def preprocess_face(face_bgr: np.ndarray, input_size: Tuple[int, int] = INPUT_SIZE) -> np.ndarray:
     """Preprocess one face for grayscale CNN models."""
     gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, input_size)
-    gray = cv2.equalizeHist(gray)
+    gray = _resize_with_aspect_ratio(gray, target_size=input_size)
     gray = gray.astype("float32") / 255.0
     return np.expand_dims(gray, axis=-1)
 
 
 def preprocess_face_transfer(face_bgr: np.ndarray, input_size: Tuple[int, int]) -> np.ndarray:
-    """Preprocess one face for transfer models (BGR->RGB, resize, EfficientNet normalize)."""
+    """Preprocess one face for transfer models using the same train-time transform."""
     if face_bgr.ndim == 2:
         rgb = cv2.cvtColor(face_bgr, cv2.COLOR_GRAY2RGB)
     elif face_bgr.ndim == 3 and face_bgr.shape[-1] == 1:
@@ -553,12 +860,8 @@ def preprocess_face_transfer(face_bgr: np.ndarray, input_size: Tuple[int, int]) 
         rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
 
     target_h, target_w = int(input_size[0]), int(input_size[1])
-    if rgb.shape[0] != target_h or rgb.shape[1] != target_w:
-        interp = cv2.INTER_AREA if (rgb.shape[0] > target_h or rgb.shape[1] > target_w) else cv2.INTER_LINEAR
-        rgb = cv2.resize(rgb, (target_w, target_h), interpolation=interp)
-
-    rgb = rgb.astype("float32")
-    return efficientnet_preprocess_input(rgb)
+    rgb = _resize_with_aspect_ratio(rgb, target_size=(target_h, target_w))
+    return preprocess_rgb_for_transfer(rgb, target_size=(target_h, target_w))
 
 
 def _crop_face_roi(frame_bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
@@ -569,6 +872,11 @@ def _crop_face_roi(frame_bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> Op
     y1 = max(0, int(y))
     x2 = min(frame_w, int(x + w))
     y2 = min(frame_h, int(y + h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    # Keep a square ROI so later resize to square model input does not distort facial geometry.
+    x1, y1, x2, y2 = _square_bbox(x1, y1, x2, y2, frame_w=frame_w, frame_h=frame_h)
     if x2 <= x1 or y2 <= y1:
         return None
 
@@ -591,6 +899,111 @@ def infer_model_profile(model) -> Tuple[Tuple[int, int], str]:
     w = int(w) if w is not None else INPUT_SIZE[1]
     mode = "transfer" if int(c or 1) == 3 else "cnn"
     return (h, w), mode
+
+
+def preprocess_image(
+    image: Union[str, np.ndarray],
+    model: Any = None,
+    detector: Optional[Dict[str, Any]] = None,
+    detection_confidence_threshold: float = DETECTION_CONFIDENCE_THRESHOLD,
+) -> np.ndarray:
+    """Preprocess image path/array into a model-ready tensor with robust face-only cropping."""
+    if isinstance(image, str):
+        frame = cv2.imread(image)
+        if frame is None:
+            raise FileNotFoundError(f"Could not read image: {image}")
+    elif isinstance(image, np.ndarray):
+        frame = image.copy()
+    else:
+        raise TypeError("image must be a file path or numpy array")
+
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.ndim == 3 and frame.shape[-1] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    elif frame.ndim != 3 or frame.shape[-1] not in {1, 3}:
+        raise ValueError("Unsupported image array shape for preprocessing")
+
+    if frame.dtype != np.uint8:
+        data = frame.astype(np.float32)
+        if float(np.max(data)) <= 1.0:
+            data = data * 255.0
+        frame = np.clip(data, 0.0, 255.0).astype(np.uint8)
+
+    model = model or load_model_safe(BEST_MODEL_PATH if os.path.exists(BEST_MODEL_PATH) else None)
+    detector_bundle = detector or init_face_detector()
+    input_size, model_mode = infer_model_profile(model)
+
+    frame_h, frame_w = frame.shape[:2]
+    detect_scale = 1.0
+    if frame_w < 640:
+        detect_scale = 640.0 / float(max(frame_w, 1))
+    elif frame_w > 960:
+        detect_scale = 960.0 / float(max(frame_w, 1))
+
+    if abs(detect_scale - 1.0) > 1e-6:
+        detect_w = max(160, int(frame_w * detect_scale))
+        detect_h = max(120, int(frame_h * detect_scale))
+        detect_frame = cv2.resize(frame, (detect_w, detect_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        detect_w, detect_h = frame_w, frame_h
+        detect_frame = frame
+
+    detections = _extract_faces(detector_bundle, _enhance_for_detection(detect_frame))
+    sx = frame_w / float(max(detect_w, 1))
+    sy = frame_h / float(max(detect_h, 1))
+
+    candidates: List[Dict[str, Any]] = []
+    for det in detections:
+        score = float(det.get("score", 0.0))
+        if score < float(detection_confidence_threshold):
+            continue
+
+        x, y, w, h = det.get("bbox", (0, 0, 0, 0))
+        scaled_box = (int(x * sx), int(y * sy), int(w * sx), int(h * sy))
+        fixed_box = _sanitize_bbox(scaled_box, frame_w=frame_w, frame_h=frame_h)
+        if fixed_box is None:
+            continue
+
+        scaled_keypoints: Dict[str, Tuple[int, int]] = {}
+        for name, point in det.get("keypoints", {}).items():
+            if not isinstance(point, (tuple, list)) or len(point) < 2:
+                continue
+            px, py = point
+            scaled_keypoints[name] = (int(px * sx), int(py * sy))
+
+        candidates.append(
+            {
+                "bbox": fixed_box,
+                "score": score,
+                "keypoints": scaled_keypoints,
+            }
+        )
+
+    if not candidates:
+        raise ValueError("No face detected in input image")
+
+    # Pick the most reliable face candidate (largest area + confidence).
+    best = max(candidates, key=lambda item: (item["bbox"][2] * item["bbox"][3], item.get("score", 0.0)))
+    x, y, w, h = best["bbox"]
+    face = _crop_face_roi(frame, (x, y, w, h))
+    if face is None:
+        raise ValueError("Face detected but valid crop could not be produced")
+
+    eyes = best.get("keypoints", {})
+    if "left_eye" in eyes and "right_eye" in eyes:
+        left_eye_global = eyes["left_eye"]
+        right_eye_global = eyes["right_eye"]
+        left_eye = (max(0, left_eye_global[0] - x), max(0, left_eye_global[1] - y))
+        right_eye = (max(0, right_eye_global[0] - x), max(0, right_eye_global[1] - y))
+        face = _rotate_by_eyes(face, left_eye=left_eye, right_eye=right_eye)
+
+    if model_mode == "transfer":
+        tensor = preprocess_face_transfer(face, input_size=input_size)
+    else:
+        tensor = preprocess_face(face, input_size=input_size)
+
+    return np.expand_dims(np.asarray(tensor, dtype=np.float32), axis=0)
 
 
 def _predict_faces_probs_batch(
@@ -704,7 +1117,7 @@ def predict_frame(
 
     tracked_faces: List[Dict[str, Any]] = []
     if run_detection or predictor is None:
-        detections = _extract_faces(detector_bundle, resized)
+        detections = _extract_faces(detector_bundle, _enhance_for_detection(resized))
         sx = frame_w / float(detect_w)
         sy = frame_h / float(detect_h)
 
@@ -738,10 +1151,11 @@ def predict_frame(
         if predictor is not None:
             track_ids = predictor.assign_track_ids([face["bbox"] for face in face_candidates])
             for face, track_id in zip(face_candidates, track_ids):
+                stabilized_box = predictor.get_track_box(int(track_id), face["bbox"])
                 tracked_faces.append(
                     {
                         "id": int(track_id),
-                        "bbox": face["bbox"],
+                        "bbox": stabilized_box,
                         "score": float(face.get("score", 1.0)),
                         "keypoints": face.get("keypoints", {}),
                     }
