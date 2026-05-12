@@ -127,8 +127,24 @@ def _resolve_haar_cascade_path() -> str:
     if data_dir:
         return os.path.join(data_dir, "haarcascade_frontalface_default.xml")
 
-    cv2_dir = os.path.dirname(cv2.__file__)
-    return os.path.join(cv2_dir, "data", "haarcascade_frontalface_default.xml")
+    cv2_file = getattr(cv2, "__file__", None)
+    if cv2_file:
+        cv2_dir = os.path.dirname(cv2_file)
+        return os.path.join(cv2_dir, "data", "haarcascade_frontalface_default.xml")
+
+    # Colab/system fallback locations
+    fallback_dirs = [
+        "/usr/share/opencv4/haarcascades",
+        "/usr/share/opencv/haarcascades",
+        "/usr/local/share/opencv4/haarcascades",
+        "/usr/local/share/opencv/haarcascades",
+    ]
+    for candidate in fallback_dirs:
+        path = os.path.join(candidate, "haarcascade_frontalface_default.xml")
+        if os.path.exists(path):
+            return path
+
+    return ""
 
 
 HAAR_CASCADE_PATH = _resolve_haar_cascade_path()
